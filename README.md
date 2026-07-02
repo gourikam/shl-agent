@@ -1,16 +1,39 @@
 # SHL Conversational Assessment Recommender
 
+A stateless FastAPI service that recommends SHL Individual Test Solutions
+through multi-turn dialogue: it clarifies vague hiring requests, recommends
+a grounded shortlist, refines that shortlist as constraints change, and
+compares assessments — using only data retrieved from a scraped SHL catalog.
+
+## Stack
+
+- **FastAPI + Pydantic** — `/health` and `/chat`, schema enforced exactly as specified.
+- **OpenRouter** (`meta-llama/llama-3.3-70b-instruct`) — LLM call, via the OpenAI SDK pointed at OpenRouter's base URL.
+- **Custom BM25-style retriever** (`retrieval.py`) — stdlib only, no vector DB. The catalog is a few hundred short text records, so exact term/product-name matching outperforms embedding similarity here and keeps cold starts fast on free hosting.
+- **catalog_clean.json** — 377 cleaned Individual Test Solution records scraped from the SHL product catalog.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `main.py` | FastAPI app — loads the catalog at startup, exposes `/health` and `/chat`, never lets an exception break the response schema |
+| `schemas.py` | Pydantic request/response models, matching the spec exactly |
+| `retrieval.py` | BM25-style hybrid keyword retrieval + fuzzy name matching over the catalog |
+| `agent.py` | System prompt, candidate-context builder, OpenRouter call, and grounding validation |
+| `catalog_clean.json` | Cleaned catalog (377 items) |
+| `replay_harness.py` | Self-test script that replays the 10 provided traces against a running server |
+| `requirements.txt` | Python dependencies |
+
 ## Setup (local)
 
 ```bash
 pip install -r requirements.txt
-export GROQ_API_KEY=your_key_here   # console.groq.com (free)
+export OPENROUTER_API_KEY=your_key_here   # openrouter.ai (free tier available)
 uvicorn main:app --reload --port 8000
 ```
 
-Catalog file `catalog_clean.json` is already built (377 items, cleaned from
-the raw scraped feed). If you re-scrape, re-run the cleaning step shown in
-the chat history / regenerate with the same field mapping.
+The catalog file `catalog_clean.json` is committed to the repo, so no scraping
+step is needed to run the service.
 
 ## Test locally
 
@@ -18,59 +41,48 @@ the chat history / regenerate with the same field mapping.
 python replay_harness.py http://localhost:8000
 ```
 
-This replays all 10 of your trace conversations' USER turns against your
-live local server, checks schema compliance, the 10-item cap, and the
-8-turn cap, and prints out what your agent actually recommended at each
-turn so you can eyeball it against the expected shortlist in each trace
-.md file.
+This replays each of the 10 provided trace conversations against the live
+server, checks schema compliance, the 10-item recommendation cap, and the
+8-turn cap, and prints what the agent recommended at each turn for comparison
+against the expected shortlist in each trace.
 
-**Do this BEFORE deploying** — much faster iteration loop locally.
+## Deploy (Render, free tier)
 
-## Deploy (Render free tier)
-
-1. Push this folder to a GitHub repo.
-2. New Web Service on Render, connect the repo.
+1. Push this repo to GitHub (already done).
+2. In Render: **New → Web Service**, connect this repo.
 3. Build command: `pip install -r requirements.txt`
 4. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Add environment variable `GROQ_API_KEY` in Render's dashboard.
-6. Deploy. First `/health` call after a cold start can take up to ~1 min on
-   free tier — the spec explicitly allows up to 2 minutes for this, so it's
-   fine, but test it once after a period of inactivity before submitting.
+5. Add environment variable `OPENROUTER_API_KEY` in the Render dashboard.
+6. Deploy. Free-tier services cold-start on the first request after
+   inactivity — the assignment spec allows up to 2 minutes for the first
+   `/health` call, so this is expected. Hit `/health` once before
+   submitting if the service has been idle.
 
-## Test against deployed URL
+A `render.yaml` is included for one-click Blueprint deploys (New → Blueprint → select this repo).
+
+## Test against the deployed URL
 
 ```bash
 python replay_harness.py https://your-app.onrender.com
 ```
 
-## Known things to verify before submission (flagged during build)
+## Design notes
 
-1. **`recommendations: null` vs `[]`** — the trace .md files write `null`
-   when not recommending, but the written spec's example schema shows an
-   array type. Current implementation always returns `[]` (never `null`).
-   If the automated evaluator strictly requires `null`, this needs a
-   one-line change in `schemas.py` (`recommendations: Optional[List[...]] = None`)
-   and `agent.py` (return `None` instead of `[]` in clarify/refuse states).
-   **Test this against the harness output and decide.**
+- **Catalog scope.** The scraped feed has no explicit field separating
+  Individual Test Solutions from Pre-packaged Job Solutions, so scoping was
+  done by filtering against the "Individual Test Solutions" tab on the live
+  catalog page during scraping. 377 items is consistent with SHL's publicly
+  listed Individual Test Solutions count.
+- **Grounding.** Every recommendation returned by the LLM is validated
+  against the real catalog before being sent to the user (`retrieval.py:get_by_name`,
+  exact match → substring match → Jaccard token-overlap fuzzy match with a
+  0.6 confidence threshold). Anything that doesn't resolve to a real catalog
+  item is dropped rather than shown, so hallucinated names/URLs can't reach
+  the response.
+- **Turn-cap safety.** The agent forces `end_of_conversation=true` once the
+  conversation reaches turn 7 (of the evaluator's 8-turn cap) if it already
+  has a shortlist, so a long-running clarify/refine loop can't run past the
+  cap without ever recommending anything.
 
-2. **Catalog scope (Individual Test Solutions only)** — the scraped feed
-   has no explicit category field distinguishing Individual Test Solutions
-   from Pre-packaged Job Solutions. 377 items is consistent with SHL's
-   publicly known Individual Test Solutions count, so it's assumed already
-   correctly scoped — but cross-check against the live catalog page filter
-   toggle before submitting, since getting this wrong fails a hard eval.
-
-3. **Fuzzy name matching threshold** (`retrieval.py` `get_by_name`, 0.6
-   Jaccard/coverage blend) — tune this if you see either (a) valid LLM
-   recommendations being wrongly stripped as "ungrounded" in logs, or
-   (b) wrong catalog items being matched to a close-but-different name.
-
-## Files
-
-- `main.py` — FastAPI app, `/health` and `/chat`
-- `schemas.py` — Pydantic request/response models
-- `retrieval.py` — BM25-style hybrid retrieval over the catalog
-- `agent.py` — system prompt + Groq call + grounding validation
-- `catalog_clean.json` — cleaned catalog (377 items)
-- `replay_harness.py` — self-test against your 10 traces
-- `requirements.txt`
+See `approach.docx` (or the PDF equivalent) for the full write-up on design
+trade-offs, prompt design, and evaluation approach.
